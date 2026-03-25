@@ -1,7 +1,12 @@
 export type Severity = 'high' | 'medium' | 'low' | 'safe'
 export type AlertStatus = 'new' | 'acknowledged' | 'resolved'
+
+// Backend sends: sos_gesture | person_surrounded | proximity_warning
+// Keep legacy types too so old data doesn't break
 export type AlertType =
   | 'sos_gesture'
+  | 'person_surrounded'
+  | 'proximity_warning'
   | 'surrounded_high'
   | 'surrounded_medium'
   | 'lone_woman'
