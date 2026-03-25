@@ -77,9 +77,21 @@ function CameraCard({ cam, selected, onSelect, onDelete }: CameraCardProps) {
 // ─── Live Video Panel ─────────────────────────────────────────────────────────
 function LiveView({ cam }: { cam: Camera }) {
   const [streaming, setStreaming] = useState(false)
+  const [streamKey, setStreamKey] = useState(0)   // increment to force img remount + close TCP
   const [streamTab, setStreamTab] = useState<'live' | 'analytics' | 'settings'>('live')
 
-  const streamUrl = `/api/stream/${cam.id}`
+  // Add unique timestamp so browser never reuses a cached connection
+  const streamUrl = `http://localhost:8000/api/stream/${cam.id}?k=${streamKey}`
+
+  function startStream() {
+    setStreamKey(k => k + 1)   // new URL = browser opens a fresh TCP connection
+    setStreaming(true)
+  }
+
+  function stopStream() {
+    setStreaming(false)
+    // No need to set streamKey here — img is removed from DOM which closes the connection
+  }
 
   return (
     <div className="bg-white rounded-2xl border border-gray-100 shadow-sm flex flex-col h-full">
@@ -138,7 +150,7 @@ function LiveView({ cam }: { cam: Camera }) {
             <span className="text-sm">Stream not active</span>
             {cam.status && (
               <button
-                onClick={() => setStreaming(true)}
+                onClick={startStream}
                 className="flex items-center gap-2 bg-primary-600 text-white px-5 py-2 rounded-lg text-sm font-medium hover:bg-primary-700"
               >
                 <Play size={14} /> Start Stream
