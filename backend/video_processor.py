@@ -1,21 +1,22 @@
 """
 video_processor.py — Background video loop + MJPEG frame buffer
+
+WS broadcasting is handled entirely by main.py's WebSocket endpoint.
+This file only maintains state — it does NOT broadcast directly.
 """
 
 import cv2
 import time
 import threading
 import asyncio
-import json
 import logging
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
-import numpy as np
 
 logger = logging.getLogger("video_processor")
 
-# Alert cooldowns: (track_id, type) → fires at most once per interval
+# Alert cooldowns per (track_id, type) — prevents alert flood
 ALERT_COOLDOWN = {
     "sos_gesture":       3.0,
     "person_surrounded": 5.0,
@@ -33,32 +34,29 @@ class VideoProcessor:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
-        # Per-frame counts (reset each frame)
         self._stats = {
-            "women_count":         0,
-            "men_count":           0,
-            "person_count":        0,
+            # Current-frame counts (go to 0 when nobody in frame)
+            "women_count":  0,
+            "men_count":    0,
+            "person_count": 0,
+            # Session accumulators (only go up, never reset to 0)
             "alert_count":         0,
-            "fps":                 0.0,
-            "model_ready":         False,
-            # Session accumulators — never reset to 0
             "session_women_total": 0,
             "session_men_total":   0,
             "session_sos":         0,
             "session_surrounded":  0,
             "session_proximity":   0,
+            # Meta
+            "fps":         0.0,
+            "model_ready": False,
         }
         self._alerts_queue: list = []
-
-        # dedup: (track_id, alert_type) → last fired time
         self._alert_last_fired: dict = {}
 
+        # WS clients set — populated by main.py but NOT used for direct broadcast here
         self.ws_clients: set = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._detector = None
-
-        self._last_ws_push: float = 0.0
-        self._WS_INTERVAL  = 2.0   # push at most every 2 seconds
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
     def start(self):
@@ -85,7 +83,7 @@ class VideoProcessor:
     def get_recent_alerts(self) -> list:
         return list(self._alerts_queue[-50:])
 
-    # ── Deduplication ──────────────────────────────────────────────────────────
+    # ── Dedup ──────────────────────────────────────────────────────────────────
     def _should_fire(self, track_id: int, alert_type: str) -> bool:
         key      = (track_id, alert_type)
         now      = time.time()
@@ -116,15 +114,15 @@ class VideoProcessor:
             return
 
         fps_display = 0.0
-        alert_total = 0
         frame_count = 0
 
-        # Session accumulators — persist across video loops
+        # Session accumulators — live outside the video loop so they survive re-loops
         session_women_total = 0
         session_men_total   = 0
         session_sos         = 0
         session_surrounded  = 0
         session_proximity   = 0
+        alert_total         = 0
 
         while self._running:
             cap = cv2.VideoCapture(self.video_path)
@@ -169,36 +167,32 @@ class VideoProcessor:
                 fps_display = 0.9 * fps_display + 0.1 / max(t_now - t_prev, 0.001)
                 t_prev      = t_now
 
-                # ── Update session accumulators ────────────────────────────
+                # Session totals — take the peak per-loop
                 w = result["women_count"]
                 m = result["men_count"]
-                if w > 0:
-                    session_women_total = max(session_women_total, w)
-                if m > 0:
-                    session_men_total = max(session_men_total, m)
+                session_women_total = max(session_women_total, w)
+                session_men_total   = max(session_men_total, m)
 
-                # ── Deduplicated alerts ────────────────────────────────────
+                # Deduplicated alerts
                 raw_alerts     = result.get("alerts", [])
                 deduped_alerts = []
                 for a in raw_alerts:
                     tid   = a.get("track_id", 0)
                     atype = a.get("type", "")
                     if self._should_fire(tid, atype):
-                        a["timestamp"] = datetime.utcnow().isoformat()
+                        # UTC timestamp with Z so browsers parse correctly
+                        a["timestamp"] = datetime.now(timezone.utc).isoformat()
                         deduped_alerts.append(a)
-                        # Count by type for session metrics
-                        if atype == "sos_gesture":
-                            session_sos += 1
-                        elif atype == "person_surrounded":
-                            session_surrounded += 1
-                        elif atype == "proximity_warning":
-                            session_proximity += 1
+                        if atype == "sos_gesture":      session_sos        += 1
+                        elif atype == "person_surrounded": session_surrounded += 1
+                        elif atype == "proximity_warning": session_proximity  += 1
 
                 alert_total += len(deduped_alerts)
 
                 if frame_count % 300 == 0:
                     self._clean_dedup_table()
 
+                # Update stats dict — main.py reads this via get_stats()
                 self._stats.update({
                     "women_count":         result["women_count"],
                     "men_count":           result["men_count"],
@@ -206,8 +200,6 @@ class VideoProcessor:
                     "alert_count":         alert_total,
                     "fps":                 round(fps_display, 1),
                     "model_ready":         True,
-                    "timestamp":           datetime.utcnow().isoformat(),
-                    # Session totals — used by dashboard metrics
                     "session_women_total": session_women_total,
                     "session_men_total":   session_men_total,
                     "session_sos":         session_sos,
@@ -215,26 +207,16 @@ class VideoProcessor:
                     "session_proximity":   session_proximity,
                 })
 
+                # Queue alerts — main.py reads these via get_recent_alerts()
                 self._alerts_queue.extend(deduped_alerts)
                 if len(self._alerts_queue) > 200:
                     self._alerts_queue = self._alerts_queue[-200:]
 
-                # ── WS push — throttled to every 2s ───────────────────────
-                now = time.time()
-                if (self._loop and self.ws_clients and
-                        now - self._last_ws_push >= self._WS_INTERVAL):
-                    self._last_ws_push = now
-                    payload = json.dumps({
-                        "type":   "stats",
-                        "stats":  self._stats,
-                        "alerts": deduped_alerts,
-                    })
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            self._broadcast(payload), self._loop
-                        )
-                    except Exception:
-                        pass
+                # ── NO WS BROADCAST HERE ──
+                # main.py's WebSocket endpoint handles all broadcasting.
+                # It calls _make_dashboard_stats() which correctly shapes the data.
+                # Broadcasting from here would send the wrong shape (women_count
+                # instead of women_monitored) causing the dashboard to blink to 0.
 
                 # Pace to source FPS
                 elapsed = time.time() - t_now
@@ -243,15 +225,6 @@ class VideoProcessor:
                     time.sleep(sleep)
 
             cap.release()
-
-    async def _broadcast(self, message: str):
-        dead = set()
-        for ws in list(self.ws_clients):
-            try:
-                await ws.send_text(message)
-            except Exception:
-                dead.add(ws)
-        self.ws_clients -= dead
 
 
 # ── Singleton ──────────────────────────────────────────────────────────────────

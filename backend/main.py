@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 
 import uvicorn
 from dotenv import load_dotenv
@@ -80,7 +80,9 @@ def _make_alert(raw: dict) -> dict:
         "proximity_warning": "Man in close proximity detected",
     }
 
-    ts       = raw.get("timestamp", datetime.utcnow().isoformat())
+    ts       = raw.get("timestamp", datetime.now(timezone.utc).isoformat())
+    if ts and not ts.endswith("Z") and "+" not in ts:
+        ts = ts + "Z"
     track_id = raw.get("track_id", 0)
 
     return {
@@ -237,7 +239,7 @@ async def get_cameras():
             "longitude":   78.1686,
             "model_desc":  "EmpowerHer YOLOv8",
             "alert_count": len(app.state.processor.get_recent_alerts()),
-            "created_at":  datetime.utcnow().isoformat(),
+            "created_at":  datetime.now(timezone.utc).isoformat(),
         }
     ]
 
