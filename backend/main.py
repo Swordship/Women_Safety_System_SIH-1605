@@ -28,31 +28,35 @@ HOST       = os.getenv("HOST", "0.0.0.0")
 PORT       = int(os.getenv("PORT", 8000))
 
 
-# ── Shape helpers ─────────────────────────────────────────────────────────────
+# ── Shape helpers ──────────────────────────────────────────────────────────────
 
 def _make_dashboard_stats(proc) -> dict:
-    """Map raw detector stats → DashboardStats shape the frontend expects."""
-    s      = proc.get_stats()
-    alerts = proc.get_recent_alerts()
+    """Map raw detector stats → DashboardStats the frontend expects."""
+    s = proc.get_stats()
 
-    sos_count        = sum(1 for a in alerts if a.get("type") == "sos_gesture")
-    surrounded_count = sum(1 for a in alerts if a.get("type") == "person_surrounded")
-    women            = s.get("women_count", 0)
-    safe             = max(0, women - sos_count - surrounded_count)
+    # Use SESSION totals so numbers never reset to 0 between frames
+    total_women = s.get("session_women_total", 0) or s.get("women_count", 0)
+    total_men   = s.get("session_men_total",   0) or s.get("men_count",   0)
+    sos         = s.get("session_sos",         0)
+    surrounded  = s.get("session_surrounded",  0)
+    proximity   = s.get("session_proximity",   0)
+    alert_total = s.get("alert_count",         0)
+    safe        = max(0, total_women - sos - surrounded)
 
     return {
-        "women_monitored": women,
-        "men_detected":    s.get("men_count", 0),
-        "alerts_today":    s.get("alert_count", 0),
+        "women_monitored": total_women,
+        "men_detected":    total_men,
+        "alerts_today":    alert_total,
         "hotspot_areas":   1,
+        # Extra fields (not in DashboardStats type but Dashboard.tsx reads them)
         "fps":             s.get("fps", 0),
         "model_ready":     s.get("model_ready", False),
         "safety_metrics": {
             "lone_women":        0,
-            "surrounded":        surrounded_count,
-            "sos_gestures":      sos_count,
+            "surrounded":        surrounded,
+            "sos_gestures":      sos,
             "safe_interactions": safe,
-            "total_women":       women,
+            "total_women":       max(total_women, 1),  # never 0 — prevents div-by-zero in progress bars
         },
     }
 
@@ -93,7 +97,7 @@ def _make_alert(raw: dict) -> dict:
     }
 
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
+# ── Lifespan ───────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Starting EmpowerHer backend...")
@@ -128,7 +132,7 @@ app.add_middleware(
 )
 
 
-# ── MJPEG stream ──────────────────────────────────────────────────────────────
+# ── MJPEG stream ───────────────────────────────────────────────────────────────
 def _mjpeg_generator(proc):
     import cv2
     import numpy as np
@@ -156,7 +160,7 @@ async def mjpeg_stream(camera_id: str):
     )
 
 
-# ── WebSocket ─────────────────────────────────────────────────────────────────
+# ── WebSocket ──────────────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -164,19 +168,18 @@ async def websocket_endpoint(ws: WebSocket):
     proc.ws_clients.add(ws)
     logger.info(f"WS connected ({len(proc.ws_clients)} total)")
     try:
-        # Immediate update on connect
+        # Send immediately on connect
         await ws.send_json({
             "type": "stats_update",
             "data": _make_dashboard_stats(proc),
         })
         while True:
-            await asyncio.sleep(1)
-            recent_raw    = proc.get_recent_alerts()[-5:]
-            recent_shaped = [_make_alert(a) for a in recent_raw]
+            await asyncio.sleep(2)
+            recent_raw = proc.get_recent_alerts()[-5:]
             await ws.send_json({
                 "type":   "stats_update",
                 "data":   _make_dashboard_stats(proc),
-                "alerts": recent_shaped,
+                "alerts": [_make_alert(a) for a in recent_raw],
             })
     except (WebSocketDisconnect, Exception):
         pass
@@ -185,7 +188,7 @@ async def websocket_endpoint(ws: WebSocket):
         logger.info(f"WS disconnected ({len(proc.ws_clients)} total)")
 
 
-# ── REST ──────────────────────────────────────────────────────────────────────
+# ── REST ───────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"status": "online", "service": "EmpowerHer Safety API"}
@@ -259,32 +262,14 @@ async def get_hotspots():
     ]
 
 
+# ── Alert status (local-only, no DB needed) ────────────────────────────────────
 @app.patch("/api/alerts/{alert_id}/acknowledge")
 async def acknowledge_alert(alert_id: str):
-    """Mark alert as acknowledged (in-memory only — no DB needed)."""
-    alerts = app.state.processor.get_recent_alerts()
-    for a in alerts:
-        ts       = a.get("timestamp", "")
-        track_id = a.get("track_id", 0)
-        if f"{track_id}_{ts}" == alert_id:
-            shaped = _make_alert(a)
-            shaped["status"] = "acknowledged"
-            return shaped
-    # If not found just return a shaped acknowledged response
     return {"id": alert_id, "status": "acknowledged"}
 
 
 @app.patch("/api/alerts/{alert_id}/resolve")
 async def resolve_alert(alert_id: str):
-    """Mark alert as resolved (in-memory only)."""
-    alerts = app.state.processor.get_recent_alerts()
-    for a in alerts:
-        ts       = a.get("timestamp", "")
-        track_id = a.get("track_id", 0)
-        if f"{track_id}_{ts}" == alert_id:
-            shaped = _make_alert(a)
-            shaped["status"] = "resolved"
-            return shaped
     return {"id": alert_id, "status": "resolved"}
 
 
