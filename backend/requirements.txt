@@ -1,0 +1,11 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+motor==3.5.1
+pymongo==4.9.1
+python-dotenv==1.0.1
+ultralytics==8.3.0
+opencv-python-headless==4.8.1.78
+mediapipe==0.10.9
+numpy==1.24.4
+Pillow==10.4.0
+python-multipart==0.0.12
