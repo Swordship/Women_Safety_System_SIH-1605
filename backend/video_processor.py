@@ -15,6 +15,13 @@ import numpy as np
 
 logger = logging.getLogger("video_processor")
 
+# ── Alert deduplication cooldowns (seconds per track_id + alert type) ─────────
+ALERT_COOLDOWN = {
+    "sos_gesture":       3.0,   # at most once every 3s per person
+    "person_surrounded": 5.0,   # at most once every 5s per person
+    "proximity_warning": 8.0,   # at most once every 8s per person
+}
+
 
 class VideoProcessor:
     def __init__(self, video_path: str, model_path: str = "./models/best.pt"):
@@ -22,7 +29,7 @@ class VideoProcessor:
         self.model_path = model_path
 
         self._latest_jpeg: Optional[bytes] = None
-        self._lock   = threading.Lock()
+        self._lock    = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
@@ -36,11 +43,18 @@ class VideoProcessor:
         }
         self._alerts_queue: list = []
 
+        # dedup: (track_id, alert_type) -> last fired timestamp
+        self._alert_last_fired: dict = {}
+
         self.ws_clients: set = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._detector = None
 
-    # ── Lifecycle ─────────────────────────────────────────────────
+        # WS throttle — only broadcast every N seconds, not every frame
+        self._last_ws_push: float = 0.0
+        self._WS_INTERVAL  = 2.0
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
     def start(self):
         if self._running:
             return
@@ -54,7 +68,7 @@ class VideoProcessor:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
 
-    # ── Public API ────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
     def get_jpeg(self) -> Optional[bytes]:
         with self._lock:
             return self._latest_jpeg
@@ -65,25 +79,40 @@ class VideoProcessor:
     def get_recent_alerts(self) -> list:
         return list(self._alerts_queue[-50:])
 
-    # ── Main loop ─────────────────────────────────────────────────
+    # ── Deduplication ─────────────────────────────────────────────────────────
+    def _should_fire(self, track_id: int, alert_type: str) -> bool:
+        key      = (track_id, alert_type)
+        now      = time.time()
+        cooldown = ALERT_COOLDOWN.get(alert_type, 5.0)
+        if now - self._alert_last_fired.get(key, 0.0) >= cooldown:
+            self._alert_last_fired[key] = now
+            return True
+        return False
+
+    def _clean_dedup_table(self):
+        now   = time.time()
+        stale = [k for k, v in self._alert_last_fired.items() if now - v > 60]
+        for k in stale:
+            del self._alert_last_fired[k]
+
+    # ── Main loop ─────────────────────────────────────────────────────────────
     def _run(self):
-        # Step 1: Load model
-        logger.info("Loading detector model (this takes ~10s first time)...")
+        logger.info("Loading detector model...")
         try:
             from detector import Detector
             self._detector = Detector(self.model_path)
             self._stats["model_ready"] = True
-            logger.info("✅ Detector loaded successfully")
+            logger.info("✅ Detector loaded")
         except Exception as e:
             logger.error(f"❌ Detector load failed: {e}")
             logger.error(traceback.format_exc())
             self._running = False
             return
 
-        fps_display  = 0.0
-        alert_total  = 0
+        fps_display = 0.0
+        alert_total = 0
+        frame_count = 0
 
-        # Step 2: Loop video
         while self._running:
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
@@ -94,6 +123,7 @@ class VideoProcessor:
             fps_src = cap.get(cv2.CAP_PROP_FPS) or 25
             logger.info(f"Video opened — source FPS: {fps_src:.1f}")
             self._detector.reset_state()
+            self._alert_last_fired.clear()
             t_prev = time.time()
 
             while self._running:
@@ -101,6 +131,8 @@ class VideoProcessor:
                 if not ret:
                     logger.info("Video ended — looping...")
                     break
+
+                frame_count += 1
 
                 # Detection
                 try:
@@ -124,13 +156,25 @@ class VideoProcessor:
                 except Exception as e:
                     logger.warning(f"JPEG encode error: {e}")
 
-                # Stats
+                # FPS
                 t_now       = time.time()
                 fps_display = 0.9 * fps_display + 0.1 / max(t_now - t_prev, 0.001)
                 t_prev      = t_now
 
-                new_alerts = result.get("alerts", [])
-                alert_total += len(new_alerts)
+                # ── Deduplicated alerts ────────────────────────────────────
+                raw_alerts     = result.get("alerts", [])
+                deduped_alerts = []
+                for a in raw_alerts:
+                    tid   = a.get("track_id", 0)
+                    atype = a.get("type", "")
+                    if self._should_fire(tid, atype):
+                        a["timestamp"] = datetime.utcnow().isoformat()
+                        deduped_alerts.append(a)
+
+                alert_total += len(deduped_alerts)
+
+                if frame_count % 300 == 0:
+                    self._clean_dedup_table()
 
                 self._stats.update({
                     "women_count":  result["women_count"],
@@ -142,19 +186,19 @@ class VideoProcessor:
                     "timestamp":    datetime.utcnow().isoformat(),
                 })
 
-                # Cache alerts
-                for a in new_alerts:
-                    a["timestamp"] = datetime.utcnow().isoformat()
-                    self._alerts_queue.append(a)
+                self._alerts_queue.extend(deduped_alerts)
                 if len(self._alerts_queue) > 200:
                     self._alerts_queue = self._alerts_queue[-200:]
 
-                # WS push
-                if self._loop and self.ws_clients:
+                # ── WS push — throttled to every 2s ───────────────────────
+                now = time.time()
+                if (self._loop and self.ws_clients and
+                        now - self._last_ws_push >= self._WS_INTERVAL):
+                    self._last_ws_push = now
                     payload = json.dumps({
                         "type":   "stats",
                         "stats":  self._stats,
-                        "alerts": new_alerts,
+                        "alerts": deduped_alerts,
                     })
                     try:
                         asyncio.run_coroutine_threadsafe(
@@ -181,7 +225,7 @@ class VideoProcessor:
         self.ws_clients -= dead
 
 
-# ── Singleton ─────────────────────────────────────────────────────
+# ── Singleton ─────────────────────────────────────────────────────────────────
 _processor: Optional[VideoProcessor] = None
 
 def get_processor() -> VideoProcessor:
