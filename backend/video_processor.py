@@ -15,11 +15,11 @@ import numpy as np
 
 logger = logging.getLogger("video_processor")
 
-# ── Alert deduplication cooldowns (seconds per track_id + alert type) ─────────
+# Alert cooldowns: (track_id, type) → fires at most once per interval
 ALERT_COOLDOWN = {
-    "sos_gesture":       3.0,   # at most once every 3s per person
-    "person_surrounded": 5.0,   # at most once every 5s per person
-    "proximity_warning": 8.0,   # at most once every 8s per person
+    "sos_gesture":       3.0,
+    "person_surrounded": 5.0,
+    "proximity_warning": 8.0,
 }
 
 
@@ -33,28 +33,34 @@ class VideoProcessor:
         self._running = False
         self._thread: Optional[threading.Thread] = None
 
+        # Per-frame counts (reset each frame)
         self._stats = {
-            "women_count":  0,
-            "men_count":    0,
-            "person_count": 0,
-            "alert_count":  0,
-            "fps":          0.0,
-            "model_ready":  False,
+            "women_count":         0,
+            "men_count":           0,
+            "person_count":        0,
+            "alert_count":         0,
+            "fps":                 0.0,
+            "model_ready":         False,
+            # Session accumulators — never reset to 0
+            "session_women_total": 0,
+            "session_men_total":   0,
+            "session_sos":         0,
+            "session_surrounded":  0,
+            "session_proximity":   0,
         }
         self._alerts_queue: list = []
 
-        # dedup: (track_id, alert_type) -> last fired timestamp
+        # dedup: (track_id, alert_type) → last fired time
         self._alert_last_fired: dict = {}
 
         self.ws_clients: set = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._detector = None
 
-        # WS throttle — only broadcast every N seconds, not every frame
         self._last_ws_push: float = 0.0
-        self._WS_INTERVAL  = 2.0
+        self._WS_INTERVAL  = 2.0   # push at most every 2 seconds
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
     def start(self):
         if self._running:
             return
@@ -68,7 +74,7 @@ class VideoProcessor:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ─────────────────────────────────────────────────────────────
     def get_jpeg(self) -> Optional[bytes]:
         with self._lock:
             return self._latest_jpeg
@@ -79,7 +85,7 @@ class VideoProcessor:
     def get_recent_alerts(self) -> list:
         return list(self._alerts_queue[-50:])
 
-    # ── Deduplication ─────────────────────────────────────────────────────────
+    # ── Deduplication ──────────────────────────────────────────────────────────
     def _should_fire(self, track_id: int, alert_type: str) -> bool:
         key      = (track_id, alert_type)
         now      = time.time()
@@ -95,7 +101,7 @@ class VideoProcessor:
         for k in stale:
             del self._alert_last_fired[k]
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+    # ── Main loop ──────────────────────────────────────────────────────────────
     def _run(self):
         logger.info("Loading detector model...")
         try:
@@ -113,6 +119,13 @@ class VideoProcessor:
         alert_total = 0
         frame_count = 0
 
+        # Session accumulators — persist across video loops
+        session_women_total = 0
+        session_men_total   = 0
+        session_sos         = 0
+        session_surrounded  = 0
+        session_proximity   = 0
+
         while self._running:
             cap = cv2.VideoCapture(self.video_path)
             if not cap.isOpened():
@@ -121,7 +134,7 @@ class VideoProcessor:
                 continue
 
             fps_src = cap.get(cv2.CAP_PROP_FPS) or 25
-            logger.info(f"Video opened — source FPS: {fps_src:.1f}")
+            logger.info(f"Video opened — FPS: {fps_src:.1f}")
             self._detector.reset_state()
             self._alert_last_fired.clear()
             t_prev = time.time()
@@ -139,15 +152,10 @@ class VideoProcessor:
                     result = self._detector.process_frame(frame)
                 except Exception as e:
                     logger.warning(f"Detection error: {e}")
-                    result = {
-                        "frame": frame,
-                        "women_count": 0,
-                        "men_count": 0,
-                        "person_count": 0,
-                        "alerts": [],
-                    }
+                    result = {"frame": frame, "women_count": 0,
+                              "men_count": 0, "person_count": 0, "alerts": []}
 
-                # Encode JPEG
+                # JPEG encode
                 try:
                     _, buf = cv2.imencode(".jpg", result["frame"],
                                           [cv2.IMWRITE_JPEG_QUALITY, 80])
@@ -161,6 +169,14 @@ class VideoProcessor:
                 fps_display = 0.9 * fps_display + 0.1 / max(t_now - t_prev, 0.001)
                 t_prev      = t_now
 
+                # ── Update session accumulators ────────────────────────────
+                w = result["women_count"]
+                m = result["men_count"]
+                if w > 0:
+                    session_women_total = max(session_women_total, w)
+                if m > 0:
+                    session_men_total = max(session_men_total, m)
+
                 # ── Deduplicated alerts ────────────────────────────────────
                 raw_alerts     = result.get("alerts", [])
                 deduped_alerts = []
@@ -170,6 +186,13 @@ class VideoProcessor:
                     if self._should_fire(tid, atype):
                         a["timestamp"] = datetime.utcnow().isoformat()
                         deduped_alerts.append(a)
+                        # Count by type for session metrics
+                        if atype == "sos_gesture":
+                            session_sos += 1
+                        elif atype == "person_surrounded":
+                            session_surrounded += 1
+                        elif atype == "proximity_warning":
+                            session_proximity += 1
 
                 alert_total += len(deduped_alerts)
 
@@ -177,13 +200,19 @@ class VideoProcessor:
                     self._clean_dedup_table()
 
                 self._stats.update({
-                    "women_count":  result["women_count"],
-                    "men_count":    result["men_count"],
-                    "person_count": result["person_count"],
-                    "alert_count":  alert_total,
-                    "fps":          round(fps_display, 1),
-                    "model_ready":  True,
-                    "timestamp":    datetime.utcnow().isoformat(),
+                    "women_count":         result["women_count"],
+                    "men_count":           result["men_count"],
+                    "person_count":        result["person_count"],
+                    "alert_count":         alert_total,
+                    "fps":                 round(fps_display, 1),
+                    "model_ready":         True,
+                    "timestamp":           datetime.utcnow().isoformat(),
+                    # Session totals — used by dashboard metrics
+                    "session_women_total": session_women_total,
+                    "session_men_total":   session_men_total,
+                    "session_sos":         session_sos,
+                    "session_surrounded":  session_surrounded,
+                    "session_proximity":   session_proximity,
                 })
 
                 self._alerts_queue.extend(deduped_alerts)
@@ -225,7 +254,7 @@ class VideoProcessor:
         self.ws_clients -= dead
 
 
-# ── Singleton ─────────────────────────────────────────────────────────────────
+# ── Singleton ──────────────────────────────────────────────────────────────────
 _processor: Optional[VideoProcessor] = None
 
 def get_processor() -> VideoProcessor:
