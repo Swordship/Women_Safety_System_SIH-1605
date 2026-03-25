@@ -7,6 +7,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import uvicorn
 from dotenv import load_dotenv
@@ -27,21 +28,82 @@ HOST       = os.getenv("HOST", "0.0.0.0")
 PORT       = int(os.getenv("PORT", 8000))
 
 
-# ── Lifespan ──────────────────────────────────────────────────────
+# ── Shape helpers ─────────────────────────────────────────────────────────────
+
+def _make_dashboard_stats(proc) -> dict:
+    """Map raw detector stats → DashboardStats shape the frontend expects."""
+    s      = proc.get_stats()
+    alerts = proc.get_recent_alerts()
+
+    sos_count        = sum(1 for a in alerts if a.get("type") == "sos_gesture")
+    surrounded_count = sum(1 for a in alerts if a.get("type") == "person_surrounded")
+    women            = s.get("women_count", 0)
+    safe             = max(0, women - sos_count - surrounded_count)
+
+    return {
+        "women_monitored": women,
+        "men_detected":    s.get("men_count", 0),
+        "alerts_today":    s.get("alert_count", 0),
+        "hotspot_areas":   1,
+        "fps":             s.get("fps", 0),
+        "model_ready":     s.get("model_ready", False),
+        "safety_metrics": {
+            "lone_women":        0,
+            "surrounded":        surrounded_count,
+            "sos_gestures":      sos_count,
+            "safe_interactions": safe,
+            "total_women":       women,
+        },
+    }
+
+
+_ALERT_TITLES = {
+    "sos_gesture":       "SOS Gesture Detected",
+    "person_surrounded": "Person Surrounded",
+    "proximity_warning": "Proximity Warning",
+}
+
+def _make_alert(raw: dict) -> dict:
+    """Map raw detector alert → Alert shape the frontend expects."""
+    alert_type = raw.get("type", "proximity_warning")
+    sub        = raw.get("sub_type", raw.get("sos_type", ""))
+    conf       = raw.get("confidence", 0.0)
+    n_men      = raw.get("surrounding_count", 2)
+
+    descriptions = {
+        "sos_gesture":       f"SOS signal: {sub} (confidence {conf:.0%})",
+        "person_surrounded": f"Surrounded by {n_men} men nearby",
+        "proximity_warning": "Man in close proximity detected",
+    }
+
+    ts       = raw.get("timestamp", datetime.utcnow().isoformat())
+    track_id = raw.get("track_id", 0)
+
+    return {
+        "id":          f"{track_id}_{ts}",
+        "title":       _ALERT_TITLES.get(alert_type, "Safety Alert"),
+        "description": descriptions.get(alert_type, ""),
+        "camera_id":   "cam_001",
+        "camera_name": "Main Camera",
+        "location":    "Main Camera Zone",
+        "severity":    raw.get("severity", "medium"),
+        "alert_type":  alert_type,
+        "status":      "new",
+        "timestamp":   ts,
+    }
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("🚀 Starting EmpowerHer backend...")
-
     try:
         from video_processor import init_processor
         proc = init_processor(VIDEO_PATH, MODEL_PATH)
-
-        # FIX: use get_running_loop() not get_event_loop() in async context
         proc._loop = asyncio.get_running_loop()
         proc.start()
-
         app.state.processor = proc
-        logger.info("✅ VideoProcessor thread started — model loading in background")
+        logger.info("✅ VideoProcessor started")
     except Exception as e:
         logger.error(f"❌ Startup error: {e}", exc_info=True)
         raise
@@ -66,7 +128,7 @@ app.add_middleware(
 )
 
 
-# ── MJPEG stream ─────────────────────────────────────────────────
+# ── MJPEG stream ──────────────────────────────────────────────────────────────
 def _mjpeg_generator(proc):
     import cv2
     import numpy as np
@@ -86,7 +148,6 @@ def _mjpeg_generator(proc):
 
 @app.get("/api/stream/{camera_id:path}")
 async def mjpeg_stream(camera_id: str):
-    # FIX: accept any camera_id including "undefined" — always serve the same stream
     proc = app.state.processor
     return StreamingResponse(
         _mjpeg_generator(proc),
@@ -95,7 +156,7 @@ async def mjpeg_stream(camera_id: str):
     )
 
 
-# ── WebSocket ─────────────────────────────────────────────────────
+# ── WebSocket ─────────────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -103,16 +164,19 @@ async def websocket_endpoint(ws: WebSocket):
     proc.ws_clients.add(ws)
     logger.info(f"WS connected ({len(proc.ws_clients)} total)")
     try:
-        # Send immediate stats on connect so dashboard gets data right away
-        await ws.send_json({"type": "stats", "stats": proc.get_stats()})
+        # Immediate update on connect
+        await ws.send_json({
+            "type": "stats_update",
+            "data": _make_dashboard_stats(proc),
+        })
         while True:
             await asyncio.sleep(1)
-            stats = proc.get_stats()
-            recent = proc.get_recent_alerts()[-5:]
+            recent_raw    = proc.get_recent_alerts()[-5:]
+            recent_shaped = [_make_alert(a) for a in recent_raw]
             await ws.send_json({
-                "type":   "stats",
-                "stats":  stats,
-                "alerts": recent,
+                "type":   "stats_update",
+                "data":   _make_dashboard_stats(proc),
+                "alerts": recent_shaped,
             })
     except (WebSocketDisconnect, Exception):
         pass
@@ -121,7 +185,7 @@ async def websocket_endpoint(ws: WebSocket):
         logger.info(f"WS disconnected ({len(proc.ws_clients)} total)")
 
 
-# ── REST ──────────────────────────────────────────────────────────
+# ── REST ──────────────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return {"status": "online", "service": "EmpowerHer Safety API"}
@@ -140,38 +204,59 @@ async def health():
 
 @app.get("/api/stats")
 async def get_stats():
-    return app.state.processor.get_stats()
+    return _make_dashboard_stats(app.state.processor)
 
 
 @app.get("/api/alerts")
 async def get_alerts(limit: int = 50):
-    """
-    Returns a plain list so Dashboard.tsx can call .map() directly.
-    Frontend does: const alerts = await fetch('/api/alerts?limit=5').then(r => r.json())
-    then: alerts.map(...)   ← works because this is now an array
-    """
-    all_alerts = app.state.processor.get_recent_alerts()
-    return all_alerts[-limit:]
-
-
-@app.get("/api/cameras")
-async def get_cameras():
-    # FIX: return BOTH id and camera_id so frontend works regardless of which field it reads
-    return [
-        {
-            "id":         "cam_001",
-            "camera_id":  "cam_001",
-            "name":       "Main Camera",
-            "status":     "active",
-            "stream_url": f"http://localhost:{PORT}/api/stream/cam_001",
-            "rtsp_url":   "",
-        }
-    ]
+    raw = app.state.processor.get_recent_alerts()
+    return [_make_alert(a) for a in raw[-limit:]]
 
 
 @app.get("/api/alerts/recent")
 async def recent_alerts():
-    return app.state.processor.get_recent_alerts()[-10:]
+    raw = app.state.processor.get_recent_alerts()[-10:]
+    return [_make_alert(a) for a in raw]
+
+
+@app.get("/api/cameras")
+async def get_cameras():
+    return [
+        {
+            "id":          "cam_001",
+            "camera_id":   "cam_001",
+            "name":        "Main Camera",
+            "location":    "Main Entrance",
+            "status":      True,
+            "stream_url":  f"http://localhost:{PORT}/api/stream/cam_001",
+            "rtsp_url":    "",
+            "latitude":    13.1489,
+            "longitude":   78.1686,
+            "model_desc":  "EmpowerHer YOLOv8",
+            "alert_count": len(app.state.processor.get_recent_alerts()),
+            "created_at":  datetime.utcnow().isoformat(),
+        }
+    ]
+
+
+@app.get("/api/hotspots")
+async def get_hotspots():
+    alerts = app.state.processor.get_recent_alerts()
+    high   = sum(1 for a in alerts if a.get("severity") == "high")
+    med    = sum(1 for a in alerts if a.get("severity") == "medium")
+    return [
+        {
+            "camera_id":    "cam_001",
+            "camera_name":  "Main Camera",
+            "location":     "Main Entrance",
+            "latitude":     13.1489,
+            "longitude":    78.1686,
+            "total_alerts": len(alerts),
+            "high_count":   high,
+            "medium_count": med,
+            "low_count":    0,
+        }
+    ]
 
 
 if __name__ == "__main__":
