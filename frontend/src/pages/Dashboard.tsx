@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import { Users, UserX, Bell, MapPin, AlertCircle, AlertTriangle, Wifi, WifiOff } from 'lucide-react'
+import { Users, UserX, Bell, MapPin, AlertCircle, AlertTriangle, TrendingUp } from 'lucide-react'
 import {
   PieChart, Pie, Cell, ResponsiveContainer, Tooltip,
 } from 'recharts'
@@ -36,7 +36,7 @@ function StatCard({ label, value, sub, positive, icon, color }: StatCardProps) {
   )
 }
 
-// ─── Alert Item ───────────────────────────────────────────────────────────────
+// ─── Alert Item in sidebar ────────────────────────────────────────────────────
 function RecentAlertItem({ alert }: { alert: Alert }) {
   const Icon = alert.severity === 'high' ? AlertCircle : AlertTriangle
   return (
@@ -63,10 +63,10 @@ function MetricBar({ label, value, total, color }: { label: string; value: numbe
     <div className="mb-4">
       <div className="flex justify-between items-center mb-1">
         <span className="text-sm text-gray-700">{label}</span>
-        <span className="text-sm font-semibold text-gray-900">{value.toLocaleString()}</span>
+        <span className="text-sm text-gray-500">{value.toLocaleString()} / {total.toLocaleString()}</span>
       </div>
       <div className="h-2 bg-gray-100 rounded-full overflow-hidden">
-        <div className={cn('h-full rounded-full transition-all duration-500', color)} style={{ width: `${pct}%` }} />
+        <div className={cn('h-full rounded-full transition-all', color)} style={{ width: `${pct}%` }} />
       </div>
     </div>
   )
@@ -74,13 +74,12 @@ function MetricBar({ label, value, total, color }: { label: string; value: numbe
 
 // ─── Page ─────────────────────────────────────────────────────────────────────
 export default function Dashboard() {
-  const [stats, setStats]   = useState<DashboardStats | null>(null)
+  const [stats, setStats] = useState<DashboardStats | null>(null)
   const [alerts, setAlerts] = useState<Alert[]>([])
-  const [fps, setFps]       = useState<number>(0)
-  const [modelReady, setModelReady] = useState(false)
-  const [loading, setLoading]       = useState(true)
+  const [loading, setLoading] = useState(true)
   const [tab, setTab] = useState<'overview' | 'analytics' | 'alerts'>('overview')
-
+  const [fps, setFps]                   = useState<number>(0)
+  const [modelReady, setModelReady]     = useState(false)
   const fetchData = useCallback(async () => {
     try {
       const [s, a] = await Promise.all([
@@ -88,10 +87,7 @@ export default function Dashboard() {
         getAlerts({ limit: 5 }),
       ])
       setStats(s)
-      setAlerts(Array.isArray(a) ? a : [])
-      // getStats now returns fps + model_ready alongside DashboardStats
-      if ((s as any).fps !== undefined) setFps((s as any).fps)
-      if ((s as any).model_ready !== undefined) setModelReady((s as any).model_ready)
+      setAlerts(a)
     } catch (e) {
       console.error(e)
     } finally {
@@ -101,14 +97,18 @@ export default function Dashboard() {
 
   useEffect(() => { fetchData() }, [fetchData])
 
+  const prevStatsKey = useRef('')
   const handleWS = useCallback((msg: WSMessage) => {
     if (msg.type === 'stats_update') {
-      setStats(msg.data)
-      // Extra fields backend adds alongside DashboardStats
-      const raw = msg.data as any
-      if (raw.fps !== undefined)         setFps(raw.fps)
-      if (raw.model_ready !== undefined) setModelReady(raw.model_ready)
-      // If WS carries recent alerts, update the list
+      // Only re-render when counts actually changed — stops the blink
+      const d   = msg.data as any
+      const key = `${d.women_monitored}|${d.men_detected}|${d.alerts_today}`
+      if (key !== prevStatsKey.current) {
+        prevStatsKey.current = key
+        setStats(msg.data)
+        if (d.fps         !== undefined) setFps(d.fps)
+        if (d.model_ready !== undefined) setModelReady(d.model_ready)
+      }
       const wsAlerts = (msg as any).alerts
       if (Array.isArray(wsAlerts) && wsAlerts.length > 0) {
         setAlerts(wsAlerts.slice(0, 5))
@@ -119,7 +119,7 @@ export default function Dashboard() {
     }
   }, [])
 
-  const { connected } = useWebSocket(handleWS)
+  useWebSocket(handleWS)
 
   if (loading) {
     return (
@@ -129,48 +129,20 @@ export default function Dashboard() {
     )
   }
 
-  const sm     = stats?.safety_metrics
-  const totalW = Math.max(sm?.total_women || 0, 1)
+  const sm = stats?.safety_metrics
+  const totalW = sm?.total_women || 0
 
   const pieData = [
     { name: 'Women', value: stats?.women_monitored || 0, color: '#7c3aed' },
-    { name: 'Men',   value: stats?.men_detected    || 0, color: '#a78bfa' },
+    { name: 'Men',   value: stats?.men_detected || 0,    color: '#a78bfa' },
   ]
 
   return (
     <div className="flex flex-col h-full overflow-y-auto">
       {/* Header */}
-      <div className="px-8 pt-8 pb-4 flex items-start justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
-          <p className="text-sm text-gray-500 mt-0.5">Welcome to the EmpowerHer Analytics Dashboard</p>
-        </div>
-
-        {/* Live status badges */}
-        <div className="flex items-center gap-3 mt-1">
-          {/* FPS badge */}
-          <div className={cn(
-            'flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold',
-            modelReady ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'
-          )}>
-            <div className={cn(
-              'w-1.5 h-1.5 rounded-full',
-              modelReady ? 'bg-green-500 animate-pulse' : 'bg-yellow-500'
-            )} />
-            {modelReady ? `${fps} FPS` : 'Loading model…'}
-          </div>
-
-          {/* WebSocket badge */}
-          <div className={cn(
-            'flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold',
-            connected ? 'bg-blue-100 text-blue-700' : 'bg-gray-100 text-gray-500'
-          )}>
-            {connected
-              ? <Wifi size={12} />
-              : <WifiOff size={12} />}
-            {connected ? 'Live' : 'Reconnecting…'}
-          </div>
-        </div>
+      <div className="px-8 pt-8 pb-4">
+        <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
+        <p className="text-sm text-gray-500 mt-0.5">Welcome to the EmpowerHer Analytics Dashboard</p>
       </div>
 
       {/* Stat cards */}
@@ -178,7 +150,7 @@ export default function Dashboard() {
         <StatCard
           label="Women Monitored"
           value={stats?.women_monitored ?? 0}
-          sub="Detected in current frame"
+          sub="+5.8% from last week"
           positive
           color="bg-primary-600"
           icon={<Users size={20} className="text-white" />}
@@ -186,7 +158,7 @@ export default function Dashboard() {
         <StatCard
           label="Men Detected"
           value={stats?.men_detected ?? 0}
-          sub="Detected in current frame"
+          sub="+2.3% from last week"
           positive
           color="bg-violet-400"
           icon={<UserX size={20} className="text-white" />}
@@ -194,7 +166,7 @@ export default function Dashboard() {
         <StatCard
           label="Alerts Today"
           value={stats?.alerts_today ?? 0}
-          sub="Total since session start"
+          sub="-3.6% from last week"
           positive={false}
           color="bg-red-400"
           icon={<Bell size={20} className="text-white" />}
@@ -232,7 +204,6 @@ export default function Dashboard() {
       <div className="px-8 pb-8 flex gap-5 flex-1 min-h-0">
         {/* Left: charts */}
         <div className="flex flex-col gap-5 flex-1 min-w-0">
-
           {/* Gender Distribution */}
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6">
             <h3 className="text-base font-semibold text-gray-900 mb-4">Gender Distribution</h3>
@@ -259,14 +230,10 @@ export default function Dashboard() {
               </div>
               <div className="flex gap-8">
                 {pieData.map(d => (
-                  <div key={d.name} className="flex flex-col gap-1">
-                    <div className="flex items-center gap-2">
-                      <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: d.color }} />
-                      <span className="text-sm text-gray-600">{d.name}</span>
-                    </div>
-                    <span className="text-2xl font-bold text-gray-900 ml-5">
-                      {d.value.toLocaleString()}
-                    </span>
+                  <div key={d.name} className="flex items-center gap-2">
+                    <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: d.color }} />
+                    <span className="text-sm text-gray-600">{d.name}</span>
+                    <span className="text-sm font-semibold text-gray-900">{d.value.toLocaleString()}</span>
                   </div>
                 ))}
               </div>
@@ -276,30 +243,10 @@ export default function Dashboard() {
           {/* Safety Metrics */}
           <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-6 flex-1">
             <h3 className="text-base font-semibold text-gray-900 mb-5">Safety Metrics</h3>
-            <MetricBar
-              label="SOS Gestures"
-              value={sm?.sos_gestures || 0}
-              total={Math.max(sm?.sos_gestures || 0, 1)}
-              color="bg-red-500"
-            />
-            <MetricBar
-              label="Surrounded Women"
-              value={sm?.surrounded || 0}
-              total={Math.max(sm?.surrounded || 0, 1)}
-              color="bg-purple-500"
-            />
-            <MetricBar
-              label="Safe Interactions"
-              value={sm?.safe_interactions || 0}
-              total={totalW}
-              color="bg-green-500"
-            />
-            <MetricBar
-              label="Total Women Tracked"
-              value={sm?.total_women || 0}
-              total={Math.max(sm?.total_women || 0, 1)}
-              color="bg-primary-500"
-            />
+            <MetricBar label="Lone Women"       value={sm?.lone_women || 0}        total={totalW || 1842} color="bg-red-500" />
+            <MetricBar label="Surrounded"       value={sm?.surrounded || 0}         total={totalW || 1842} color="bg-purple-500" />
+            <MetricBar label="SOS Gestures"     value={sm?.sos_gestures || 0}       total={sm?.sos_gestures ? sm.sos_gestures * 19 : 342} color="bg-yellow-400" />
+            <MetricBar label="Safe Interactions" value={sm?.safe_interactions || 0} total={totalW || 1842} color="bg-green-500" />
           </div>
         </div>
 
@@ -317,15 +264,9 @@ export default function Dashboard() {
             </div>
             <div className="flex-1 overflow-y-auto scrollbar-thin">
               {alerts.length === 0 ? (
-                <div className="flex flex-col items-center justify-center h-full gap-2 text-center py-8">
-                  <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center">
-                    <Bell size={18} className="text-green-500" />
-                  </div>
-                  <p className="text-sm text-gray-400">No alerts yet</p>
-                  <p className="text-xs text-gray-300">System is monitoring…</p>
-                </div>
+                <div className="text-sm text-gray-400 text-center py-8">No recent alerts</div>
               ) : (
-                alerts.map((a, i) => <RecentAlertItem key={a.id || i} alert={a} />)
+                alerts.map(a => <RecentAlertItem key={a.id} alert={a} />)
               )}
             </div>
           </div>
