@@ -259,5 +259,34 @@ async def get_hotspots():
     ]
 
 
+@app.patch("/api/alerts/{alert_id}/acknowledge")
+async def acknowledge_alert(alert_id: str):
+    """Mark alert as acknowledged (in-memory only — no DB needed)."""
+    alerts = app.state.processor.get_recent_alerts()
+    for a in alerts:
+        ts       = a.get("timestamp", "")
+        track_id = a.get("track_id", 0)
+        if f"{track_id}_{ts}" == alert_id:
+            shaped = _make_alert(a)
+            shaped["status"] = "acknowledged"
+            return shaped
+    # If not found just return a shaped acknowledged response
+    return {"id": alert_id, "status": "acknowledged"}
+
+
+@app.patch("/api/alerts/{alert_id}/resolve")
+async def resolve_alert(alert_id: str):
+    """Mark alert as resolved (in-memory only)."""
+    alerts = app.state.processor.get_recent_alerts()
+    for a in alerts:
+        ts       = a.get("timestamp", "")
+        track_id = a.get("track_id", 0)
+        if f"{track_id}_{ts}" == alert_id:
+            shaped = _make_alert(a)
+            shaped["status"] = "resolved"
+            return shaped
+    return {"id": alert_id, "status": "resolved"}
+
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host=HOST, port=PORT, reload=False)
