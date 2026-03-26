@@ -56,8 +56,10 @@ class Detector:
         self._prev_nose_y:   dict = {}
         self._wrist_history: dict = {}
         self._sos_streak:    dict = defaultdict(lambda: defaultdict(int))
+        # MediaPipe result cache — reuse on skip frames
+        self._last_pose:     dict = {}   # track_id -> (landmarks, frame_count)
 
-    def process_frame(self, frame: np.ndarray) -> dict:
+    def process_frame(self, frame: np.ndarray, frame_count: int = 0) -> dict:
         vis = frame.copy()
         results = self.model.track(
             frame, persist=True, verbose=False,
@@ -89,16 +91,25 @@ class Detector:
                     ry2 = min(vis.shape[0], y2+pad)
                     cw = rx2-rx1; ch = ry2-ry1
                     if cw > 20 and ch > 20:
-                        crop_rgb    = cv2.cvtColor(vis[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2RGB)
-                        pose_result = self.pose.process(crop_rgb)
-                        if pose_result.pose_landmarks:
-                            lm = pose_result.pose_landmarks.landmark
+                        # Run MediaPipe every 2nd frame per track to save CPU/GPU time
+                        # Odd frames: run pose. Even frames: reuse cached result.
+                        run_pose = (frame_count % 2 == 1) or (track_id not in self._last_pose)
+                        if run_pose:
+                            crop_rgb    = cv2.cvtColor(vis[ry1:ry2, rx1:rx2], cv2.COLOR_BGR2RGB)
+                            pose_result = self.pose.process(crop_rgb)
+                            if pose_result.pose_landmarks:
+                                self._last_pose[track_id] = (pose_result.pose_landmarks.landmark, frame_count)
+                            else:
+                                self._last_pose.pop(track_id, None)
+                                self._sos_streak[track_id].clear()
+
+                        cached = self._last_pose.get(track_id)
+                        if cached:
+                            lm = cached[0]
                             self._draw_skeleton(vis, lm, rx1, ry1, cw, ch)
                             ok, stype, sconf = self._detect_sos(lm, track_id)
                             if ok:
                                 det["sos"] = True; det["sos_type"] = stype; det["sos_conf"] = sconf
-                        else:
-                            self._sos_streak[track_id].clear()
                 (women if gender == "woman" else men).append(det)
         women = self._proximity(women, men, vis)
         self._draw_boxes(vis, women, men)
@@ -110,6 +121,7 @@ class Detector:
         self._prev_nose_y.clear()
         self._wrist_history.clear()
         self._sos_streak.clear()
+        self._last_pose.clear()
 
     def _draw_skeleton(self, frame, lm, rx1, ry1, cw, ch, vis_thresh=0.35):
         fh, fw = frame.shape[:2]
