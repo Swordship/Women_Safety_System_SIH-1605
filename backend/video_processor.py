@@ -145,9 +145,15 @@ class VideoProcessor:
 
                 frame_count += 1
 
+                # Resize to max 640px wide before detection — biggest FPS win
+                h, w = frame.shape[:2]
+                if w > 640:
+                    scale  = 640 / w
+                    frame  = cv2.resize(frame, (640, int(h * scale)), interpolation=cv2.INTER_LINEAR)
+
                 # Detection
                 try:
-                    result = self._detector.process_frame(frame)
+                    result = self._detector.process_frame(frame, frame_count)
                 except Exception as e:
                     logger.warning(f"Detection error: {e}")
                     result = {"frame": frame, "women_count": 0,
@@ -156,7 +162,7 @@ class VideoProcessor:
                 # JPEG encode
                 try:
                     _, buf = cv2.imencode(".jpg", result["frame"],
-                                          [cv2.IMWRITE_JPEG_QUALITY, 80])
+                                          [cv2.IMWRITE_JPEG_QUALITY, 65])
                     with self._lock:
                         self._latest_jpeg = buf.tobytes()
                 except Exception as e:
