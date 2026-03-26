@@ -34,9 +34,9 @@ def _make_dashboard_stats(proc) -> dict:
     """Map raw detector stats → DashboardStats the frontend expects."""
     s = proc.get_stats()
 
-    # Use SESSION totals so numbers never reset to 0 between frames
-    total_women = s.get("session_women_total", 0) or s.get("women_count", 0)
-    total_men   = s.get("session_men_total",   0) or s.get("men_count",   0)
+    # Use unique canonical person counts (re-ID corrected, never inflated)
+    total_women = s.get("unique_women", s.get("session_women_total", 0))
+    total_men   = s.get("unique_men",   s.get("session_men_total",   0))
     sos         = s.get("session_sos",         0)
     surrounded  = s.get("session_surrounded",  0)
     proximity   = s.get("session_proximity",   0)

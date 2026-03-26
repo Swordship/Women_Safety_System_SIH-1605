@@ -173,11 +173,12 @@ class VideoProcessor:
                 fps_display = 0.9 * fps_display + 0.1 / max(t_now - t_prev, 0.001)
                 t_prev      = t_now
 
-                # Session totals — take the peak per-loop
-                w = result["women_count"]
-                m = result["men_count"]
-                session_women_total = max(session_women_total, w)
-                session_men_total   = max(session_men_total, m)
+                # Detector now returns cumulative unique person counts
+                # (via canonical ID sets) — use directly, no max() needed
+                w = result["women_count"]   # unique women seen this session
+                m = result["men_count"]     # unique men seen this session
+                session_women_total = w
+                session_men_total   = m
 
                 # Deduplicated alerts
                 raw_alerts     = result.get("alerts", [])
@@ -200,9 +201,11 @@ class VideoProcessor:
 
                 # Update stats dict — main.py reads this via get_stats()
                 self._stats.update({
-                    "women_count":         result["women_count"],
-                    "men_count":           result["men_count"],
+                    "women_count":         result.get("frame_women", result["women_count"]),
+                    "men_count":           result.get("frame_men",   result["men_count"]),
                     "person_count":        result["person_count"],
+                    "unique_women":        result["women_count"],
+                    "unique_men":          result["men_count"],
                     "alert_count":         alert_total,
                     "fps":                 round(fps_display, 1),
                     "model_ready":         True,
